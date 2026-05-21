@@ -382,10 +382,6 @@ def training(
     metrics_eval_train_count=5,
     metrics_eval_per_view=False,
     metrics_disable_lpips=False,
-    rcf_enable=False,
-    rcf_noop_identity=False,
-    rcf_debug=False,
-    rcf_debug_interval=100,
 ):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -403,9 +399,6 @@ def training(
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
-    if rcf_enable and not rcf_noop_identity:
-        print("[RCF][P0] Warning: RCF enabled but P0 only implements no-op infrastructure.")
-
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
@@ -419,16 +412,6 @@ def training(
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
-
-    if rcf_enable:
-        gaussians.init_rcf_buffers(reset=True)
-        gaussians.rcf_assert_consistent("train_init")
-
-    rcf_debug_log_path = None
-    if rcf_enable and rcf_debug:
-        rcf_debug_log_path = os.path.join(scene.model_path, "rcf_debug_log.txt")
-        with open(rcf_debug_log_path, "w", encoding="utf-8") as f:
-            f.write("iter,N,chi_mean,chi_min,chi_max,death_count,pull_count,birth_hold_count,age_mean\n")
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -447,10 +430,6 @@ def training(
                     break
             except Exception as e:
                 network_gui.conn = None
-
-        if rcf_enable:
-            with torch.no_grad():
-                gaussians._rcf_age += 1
 
         iter_start.record()
 
@@ -576,35 +555,6 @@ def training(
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
-
-            if rcf_enable and rcf_debug and rcf_debug_interval > 0 and iteration % rcf_debug_interval == 0:
-                gaussians.rcf_assert_consistent(f"iter_{iteration}")
-                summary = gaussians.rcf_debug_summary()
-                line = (
-                    f"{iteration},"
-                    f"{summary['N']},"
-                    f"{summary['chi_mean']:.6f},"
-                    f"{summary['chi_min']:.6f},"
-                    f"{summary['chi_max']:.6f},"
-                    f"{summary['death_count']},"
-                    f"{summary['pull_count']},"
-                    f"{summary['birth_hold_count']},"
-                    f"{summary['age_mean']:.2f}\n"
-                )
-                with open(rcf_debug_log_path, "a", encoding="utf-8") as f:
-                    f.write(line)
-
-                print(
-                    f"[RCF][iter {iteration}] "
-                    f"N={summary['N']} "
-                    f"chi={summary['chi_mean']:.4f}/"
-                    f"{summary['chi_min']:.4f}/"
-                    f"{summary['chi_max']:.4f} "
-                    f"death={summary['death_count']} "
-                    f"pull={summary['pull_count']} "
-                    f"birth_hold={summary['birth_hold_count']} "
-                    f"age_mean={summary['age_mean']:.1f}"
-                )
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -833,27 +783,6 @@ if __name__ == "__main__":
         default=False,
         help="Disable LPIPS during training eval. Useful when LPIPS is unavailable or too slow."
     )
-    parser.add_argument(
-        "--rcf_enable",
-        action="store_true",
-        help="Enable AURORA-GS-RCF infrastructure buffers. P0 does not change training behavior."
-    )
-    parser.add_argument(
-        "--rcf_noop_identity",
-        action="store_true",
-        help="Keep RCF as no-op identity. Used for P0 validation."
-    )
-    parser.add_argument(
-        "--rcf_debug",
-        action="store_true",
-        help="Enable RCF consistency/debug logs."
-    )
-    parser.add_argument(
-        "--rcf_debug_interval",
-        type=int,
-        default=100,
-        help="Iteration interval for RCF debug logging."
-    )
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -879,10 +808,6 @@ if __name__ == "__main__":
         metrics_eval_train_count=args.metrics_eval_train_count,
         metrics_eval_per_view=args.metrics_eval_per_view,
         metrics_disable_lpips=args.metrics_disable_lpips,
-        rcf_enable=args.rcf_enable,
-        rcf_noop_identity=args.rcf_noop_identity,
-        rcf_debug=args.rcf_debug,
-        rcf_debug_interval=args.rcf_debug_interval,
     )
 
     # All done

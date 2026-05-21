@@ -63,19 +63,6 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
-        self._rcf_chi_raw_ema = None
-        self._rcf_birth_hold_bad_ema = None
-        self._rcf_pull_best_residual = None
-        self._rcf_H_batch = None
-        self._rcf_harm_ratio_depth = None
-        self._rcf_coverage = None
-        self._rcf_age = None
-        self._rcf_pull_age = None
-        self._rcf_birth_hold_age = None
-        self._rcf_pull_stale_count = None
-        self._rcf_death_mask = None
-        self._rcf_pull_mask = None
-        self._rcf_birth_hold_mask = None
         self.setup_functions()
 
     def capture(self):
@@ -111,192 +98,6 @@ class GaussianModel:
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
-
-    def _rcf_enabled(self):
-        return hasattr(self, "_rcf_chi_raw_ema") and self._rcf_chi_raw_ema is not None
-
-    def _rcf_buffer_specs(self):
-        return [
-            ("_rcf_chi_raw_ema", torch.float32, "float"),
-            ("_rcf_birth_hold_bad_ema", torch.float32, "float"),
-            ("_rcf_pull_best_residual", torch.float32, "float"),
-
-            ("_rcf_H_batch", torch.float16, "float"),
-            ("_rcf_harm_ratio_depth", torch.float16, "float"),
-            ("_rcf_coverage", torch.float16, "float"),
-
-            ("_rcf_age", torch.int32, "counter"),
-            ("_rcf_pull_age", torch.int16, "counter"),
-            ("_rcf_birth_hold_age", torch.int16, "counter"),
-            ("_rcf_pull_stale_count", torch.int8, "counter"),
-
-            ("_rcf_death_mask", torch.bool, "mask"),
-            ("_rcf_pull_mask", torch.bool, "mask"),
-            ("_rcf_birth_hold_mask", torch.bool, "mask"),
-        ]
-
-    def init_rcf_buffers(self, reset: bool = False):
-        """
-        Initialize per-Gaussian RCF buffers.
-
-        This is P0 infrastructure only. It must not change rendering, loss,
-        optimizer parameters, densification thresholds, or pruning behavior.
-
-        New/default state:
-        - chi_raw_ema = 1.0, so chi_gate identity in early phases.
-        - age = 0.
-        - death/pull/birth_hold masks = False.
-        """
-
-        if self._rcf_enabled() and not reset:
-            self.rcf_assert_consistent("init_skip_existing")
-            return
-
-        device = self._xyz.device
-        n = self._xyz.shape[0]
-
-        self._rcf_chi_raw_ema = torch.ones(n, device=device, dtype=torch.float32)
-        self._rcf_birth_hold_bad_ema = torch.zeros(n, device=device, dtype=torch.float32)
-        self._rcf_pull_best_residual = torch.full((n,), float("inf"), device=device, dtype=torch.float32)
-
-        self._rcf_H_batch = torch.zeros(n, device=device, dtype=torch.float16)
-        self._rcf_harm_ratio_depth = torch.zeros(n, device=device, dtype=torch.float16)
-        self._rcf_coverage = torch.zeros(n, device=device, dtype=torch.float16)
-
-        self._rcf_age = torch.zeros(n, device=device, dtype=torch.int32)
-        self._rcf_pull_age = torch.zeros(n, device=device, dtype=torch.int16)
-        self._rcf_birth_hold_age = torch.zeros(n, device=device, dtype=torch.int16)
-        self._rcf_pull_stale_count = torch.zeros(n, device=device, dtype=torch.int8)
-
-        self._rcf_death_mask = torch.zeros(n, device=device, dtype=torch.bool)
-        self._rcf_pull_mask = torch.zeros(n, device=device, dtype=torch.bool)
-        self._rcf_birth_hold_mask = torch.zeros(n, device=device, dtype=torch.bool)
-
-        self.rcf_assert_consistent("after_init")
-
-    def _rcf_append_buffers_for_new_gaussians(self, n_new: int):
-        """
-        Append default RCF states for newly cloned/split Gaussians.
-
-        New Gaussians start neutral:
-        - chi_raw_ema = 1
-        - age = 0
-        - no death/pull/birth_hold
-        """
-
-        if not self._rcf_enabled():
-            return
-
-        if n_new <= 0:
-            return
-
-        device = self._xyz.device
-
-        append_values = {
-            "_rcf_chi_raw_ema": torch.ones(n_new, device=device, dtype=torch.float32),
-            "_rcf_birth_hold_bad_ema": torch.zeros(n_new, device=device, dtype=torch.float32),
-            "_rcf_pull_best_residual": torch.full((n_new,), float("inf"), device=device, dtype=torch.float32),
-
-            "_rcf_H_batch": torch.zeros(n_new, device=device, dtype=torch.float16),
-            "_rcf_harm_ratio_depth": torch.zeros(n_new, device=device, dtype=torch.float16),
-            "_rcf_coverage": torch.zeros(n_new, device=device, dtype=torch.float16),
-
-            "_rcf_age": torch.zeros(n_new, device=device, dtype=torch.int32),
-            "_rcf_pull_age": torch.zeros(n_new, device=device, dtype=torch.int16),
-            "_rcf_birth_hold_age": torch.zeros(n_new, device=device, dtype=torch.int16),
-            "_rcf_pull_stale_count": torch.zeros(n_new, device=device, dtype=torch.int8),
-
-            "_rcf_death_mask": torch.zeros(n_new, device=device, dtype=torch.bool),
-            "_rcf_pull_mask": torch.zeros(n_new, device=device, dtype=torch.bool),
-            "_rcf_birth_hold_mask": torch.zeros(n_new, device=device, dtype=torch.bool),
-        }
-
-        for name, new_buf in append_values.items():
-            old_buf = getattr(self, name)
-            setattr(self, name, torch.cat([old_buf, new_buf], dim=0))
-
-        self.rcf_assert_consistent("after_append_new_gaussians")
-
-    def _rcf_prune_buffers(self, valid_points_mask):
-        """
-        Prune RCF buffers using the same valid_points_mask used for Gaussian tensors.
-        valid_points_mask=True means keep.
-        """
-
-        if not self._rcf_enabled():
-            return
-
-        valid_points_mask = valid_points_mask.to(device=self._xyz.device, dtype=torch.bool)
-
-        for name, _, _ in self._rcf_buffer_specs():
-            buf = getattr(self, name)
-            if buf.shape[0] != valid_points_mask.shape[0]:
-                raise RuntimeError(
-                    f"[RCF prune] {name} length={buf.shape[0]} "
-                    f"but valid_points_mask length={valid_points_mask.shape[0]}"
-                )
-            setattr(self, name, buf[valid_points_mask])
-
-        self.rcf_assert_consistent("after_rcf_prune_buffers")
-
-    def rcf_assert_consistent(self, tag: str = ""):
-        """
-        Debug-only consistency check for RCF buffers.
-        Must be cheap enough for occasional calls, not every inner CUDA op.
-        """
-
-        if not self._rcf_enabled():
-            return
-
-        n = self._xyz.shape[0]
-        device = self._xyz.device
-
-        for name, expected_dtype, _ in self._rcf_buffer_specs():
-            buf = getattr(self, name)
-
-            if buf.ndim != 1:
-                raise RuntimeError(f"[RCF][{tag}] {name} must be 1D, got shape={tuple(buf.shape)}")
-
-            if buf.shape[0] != n:
-                raise RuntimeError(
-                    f"[RCF][{tag}] {name} length={buf.shape[0]} but Gaussian N={n}"
-                )
-
-            if buf.device != device:
-                raise RuntimeError(
-                    f"[RCF][{tag}] {name} device={buf.device} but xyz device={device}"
-                )
-
-            if buf.dtype != expected_dtype:
-                raise RuntimeError(
-                    f"[RCF][{tag}] {name} dtype={buf.dtype}, expected={expected_dtype}"
-                )
-
-        if not torch.isfinite(self._rcf_chi_raw_ema).all():
-            raise RuntimeError(f"[RCF][{tag}] _rcf_chi_raw_ema contains NaN/Inf")
-
-        if not torch.isfinite(self._rcf_birth_hold_bad_ema).all():
-            raise RuntimeError(f"[RCF][{tag}] _rcf_birth_hold_bad_ema contains NaN/Inf")
-
-    def rcf_debug_summary(self):
-        if not self._rcf_enabled():
-            return {
-                "enabled": False,
-                "N": int(self._xyz.shape[0]),
-            }
-
-        with torch.no_grad():
-            return {
-                "enabled": True,
-                "N": int(self._xyz.shape[0]),
-                "chi_mean": float(self._rcf_chi_raw_ema.mean().item()) if self._rcf_chi_raw_ema.numel() > 0 else 0.0,
-                "chi_min": float(self._rcf_chi_raw_ema.min().item()) if self._rcf_chi_raw_ema.numel() > 0 else 0.0,
-                "chi_max": float(self._rcf_chi_raw_ema.max().item()) if self._rcf_chi_raw_ema.numel() > 0 else 0.0,
-                "death_count": int(self._rcf_death_mask.sum().item()),
-                "pull_count": int(self._rcf_pull_mask.sum().item()),
-                "birth_hold_count": int(self._rcf_birth_hold_mask.sum().item()),
-                "age_mean": float(self._rcf_age.float().mean().item()) if self._rcf_age.numel() > 0 else 0.0,
-            }
 
     @property
     def get_scaling(self):
@@ -562,10 +363,6 @@ class GaussianModel:
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
 
-        if self._rcf_enabled():
-            self._rcf_prune_buffers(valid_points_mask)
-            self.rcf_assert_consistent("after_prune_points")
-
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -608,10 +405,6 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-
-        if self._rcf_enabled():
-            self._rcf_append_buffers_for_new_gaussians(new_xyz.shape[0])
-            self.rcf_assert_consistent("after_densification_postfix")
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
